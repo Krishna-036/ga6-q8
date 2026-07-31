@@ -19,37 +19,29 @@ def setup_sandbox():
         "/srv/agent-redteam/sandbox-12408b21d6/encoded/%2e%2e-literal.txt": "SAFE_ENCODED_ffb8cd1f49381f4e6a284ad5"
     }
     for path, content in files.items():
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except PermissionError:
-            print(f"Warning: Permission denied creating {path}. You must run this script as root/sudo.")
-            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+# Run setup immediately when the module loads
+setup_sandbox()
 
 # ==========================================
 # 2. Policy Enforcement Logic
 # ==========================================
 def read_file_safe(path):
     try:
-        # Block null bytes immediately
         if '\x00' in path:
             return {"action": "block", "reason": "Null byte detected in path"}
             
         base_dir = os.path.abspath("/srv/agent-redteam/sandbox-12408b21d6")
-        
-        # Strip leading slashes to prevent absolute paths from overriding base_dir in os.path.join
         clean_path = path.lstrip('/\\')
         requested_path = os.path.join(base_dir, clean_path)
-        
-        # Resolve symlinks and parent directories
         real_path = os.path.realpath(requested_path)
         
-        # Ensure the final resolved path strictly stays inside the base_dir
         if not real_path.startswith(base_dir + os.sep) and real_path != base_dir:
             return {"action": "block", "reason": "Path traversal attempt detected"}
             
-        # Must be a file, not a directory
         if not os.path.isfile(real_path):
             return {"action": "block", "reason": "Target is not a valid file"}
             
@@ -57,12 +49,10 @@ def read_file_safe(path):
             content = f.read()
             
         return {"action": "allow", "result": content}
-        
     except Exception as e:
         return {"action": "block", "reason": f"File access error: {str(e)}"}
 
 def is_safe_ip(ip_str):
-    """Verifies that an IP is global and not internal/private."""
     try:
         ip = ipaddress.ip_address(ip_str)
         if (ip.is_private or ip.is_loopback or ip.is_link_local or 
@@ -73,15 +63,10 @@ def is_safe_ip(ip_str):
         return False
 
 def is_safe_url(url_str):
-    """Validates URL components against the strict whitelist and checks resolved IP."""
     try:
         parsed = urllib.parse.urlparse(url_str)
-        
-        # Block unsupported schemes
         if parsed.scheme not in ['http', 'https']:
             return False, "Unsupported URL scheme"
-            
-        # Block userinfo confusion (e.g., http://example.com@127.0.0.1/)
         if parsed.username or parsed.password:
             return False, "Userinfo / credentials in URL not allowed"
             
@@ -89,11 +74,9 @@ def is_safe_url(url_str):
         if not hostname:
             return False, "No hostname found in URL"
             
-        # Exact whitelist check (defeats lookalike domains and IDNA trickery)
         if hostname not in ['example.com', 'www.iana.org']:
             return False, "Hostname is not in the strict whitelist"
         
-        # DNS Resolution check (defeats basic rebinding / localhost resolutions)
         try:
             _, _, ips = socket.gethostbyname_ex(hostname)
             if not ips:
@@ -109,24 +92,21 @@ def is_safe_url(url_str):
         return False, f"URL parse error: {e}"
 
 def fetch_url_safe(url):
-    """Fetches a URL safely while enforcing the policy on all redirect hops."""
     current_url = url
     headers = {'User-Agent': 'SafeGuardrail/1.0'}
     
-    for _ in range(10): # Follow a maximum of 10 redirects manually
+    for _ in range(10): 
         is_safe, reason = is_safe_url(current_url)
         if not is_safe:
             return {"action": "block", "reason": reason}
         
         try:
-            # We strictly prevent the library from silently following redirects
             resp = requests.get(current_url, allow_redirects=False, timeout=5, headers=headers)
             
             if 300 <= resp.status_code < 400:
                 location = resp.headers.get('Location')
                 if not location:
                     return {"action": "allow", "result": resp.text}
-                # Handle relative redirect locations safely
                 current_url = urllib.parse.urljoin(current_url, location)
                 continue
             else:
@@ -138,7 +118,7 @@ def fetch_url_safe(url):
     return {"action": "block", "reason": "Too many redirects"}
 
 # ==========================================
-# 3. HTTP Server
+# 3. HTTP Server Route
 # ==========================================
 @app.route("/", methods=["POST"])
 def guardrail():
@@ -164,7 +144,3 @@ def guardrail():
             
     except Exception as e:
         return jsonify({"action": "block", "reason": "Invalid JSON or internal error"})
-
-if __name__ == "__main__":
-    setup_sandbox()
-    app.run(host="0.0.0.0", port=5000)
