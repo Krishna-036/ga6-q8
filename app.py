@@ -1,4 +1,7 @@
 import os
+import json
+import socket
+import ipaddress
 import urllib.parse
 import requests
 from flask import Flask, request, jsonify
@@ -21,38 +24,51 @@ def setup_sandbox():
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
-# Run setup immediately when the module loads
 setup_sandbox()
 
 # ==========================================
 # 2. Policy Enforcement Logic
 # ==========================================
 def read_file_safe(path):
+    if '\x00' in path:
+        return {"action": "block", "reason": "Null byte detected"}
+        
+    base_dir = os.path.abspath("/srv/agent-redteam/sandbox-12408b21d6")
+    
+    # Handle both absolute paths and relative paths gracefully
+    if path.startswith(base_dir):
+        requested_path = path
+    else:
+        clean_path = path.lstrip('/\\')
+        requested_path = os.path.join(base_dir, clean_path)
+        
+    real_path = os.path.realpath(requested_path)
+    
+    # Check traversal
+    if not real_path.startswith(base_dir + os.sep) and real_path != base_dir:
+        return {"action": "block", "reason": "Path traversal attempt detected"}
+        
+    # Guardrail passed! Now execute the tool.
+    if not os.path.isfile(real_path):
+        # We ALLOW it, but return the natural tool error
+        return {"action": "allow", "result": "Error: File not found"}
+        
     try:
-        if '\x00' in path:
-            return {"action": "block", "reason": "Null byte detected in path"}
-            
-        base_dir = os.path.abspath("/srv/agent-redteam/sandbox-12408b21d6")
-        
-        # os.path.join safely handles both relative paths and absolute paths. 
-        # If 'path' is already an absolute path, it overrides base_dir.
-        requested_path = os.path.join(base_dir, path)
-        real_path = os.path.realpath(requested_path)
-        
-        # Ensure the final resolved path strictly stays inside the base_dir
-        if not real_path.startswith(base_dir + os.sep) and real_path != base_dir:
-            return {"action": "block", "reason": "Path traversal attempt detected"}
-            
-        if not os.path.isfile(real_path):
-            return {"action": "block", "reason": "Target is not a valid file"}
-            
         with open(real_path, 'r', encoding='utf-8') as f:
             content = f.read()
-            
         return {"action": "allow", "result": content}
     except Exception as e:
-        return {"action": "block", "reason": f"File access error: {str(e)}"}
+        return {"action": "allow", "result": f"Error reading file: {str(e)}"}
 
+def is_safe_ip(ip_str):
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or 
+            ip.is_multicast or ip.is_unspecified or getattr(ip, 'is_reserved', False)):
+            return False
+        return True
+    except ValueError:
+        return False
 
 def is_safe_url(url_str):
     try:
@@ -67,17 +83,26 @@ def is_safe_url(url_str):
         if not hostname:
             return False, "No hostname found in URL"
             
-        # Exact whitelist check (prevents all SSRF and rebinding bypasses inherently)
+        hostname = hostname.lower().rstrip('.')
+        
+        # Exact whitelist check
         if hostname not in ['example.com', 'www.iana.org']:
             return False, "Hostname is not in the strict whitelist"
+        
+        # DNS Rebinding protection
+        try:
+            _, _, ips = socket.gethostbyname_ex(hostname)
+            for ip in ips:
+                if not is_safe_ip(ip):
+                    return False, f"Domain resolves to forbidden IP: {ip}"
+        except Exception:
+            pass # Let requests fail naturally if DNS fails
             
         return True, "Safe"
     except Exception as e:
         return False, f"URL parse error: {e}"
 
-
 def fetch_url_safe(url):
-    # Tolerate benign inputs that forget the scheme
     if not url.startswith('http://') and not url.startswith('https://'):
         url = 'http://' + url
         
@@ -92,7 +117,6 @@ def fetch_url_safe(url):
         try:
             resp = requests.get(current_url, allow_redirects=False, timeout=5, headers=headers)
             
-            # Manually follow redirects to ensure the new Location is also safe
             if 300 <= resp.status_code < 400:
                 location = resp.headers.get('Location')
                 if not location:
@@ -103,27 +127,36 @@ def fetch_url_safe(url):
                 return {"action": "allow", "result": resp.text}
                 
         except Exception as e:
-            return {"action": "block", "reason": f"Request failed: {str(e)}"}
+            # Guardrail passed, but network request failed. We MUST allow it and return the error.
+            return {"action": "allow", "result": f"Network Request Failed: {str(e)}"}
             
     return {"action": "block", "reason": "Too many redirects"}
 
 # ==========================================
-# 3. HTTP Server Route (Catch-all)
+# 3. Indestructible HTTP Server Route
 # ==========================================
-# Catch all paths and methods to prevent 404/405 native Flask errors
-@app.route("/", methods=["GET", "POST", "PUT"])
-@app.route("/<path:path>", methods=["GET", "POST", "PUT"])
-def guardrail(path=""):
-    try:
-        # silent=True prevents Werkzeug from throwing a 400 Bad Request exception
-        req = request.get_json(force=True, silent=True)
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+def guardrail(path):
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
         
-        if not req:
-            return jsonify({"action": "block", "reason": "Invalid or missing JSON payload"}), 200
+    try:
+        raw_data = request.get_data(as_text=True)
+        if not raw_data:
+            return jsonify({"action": "block", "reason": "Empty payload"}), 200
+            
+        req = json.loads(raw_data)
+        
+        if not isinstance(req, dict):
+            return jsonify({"action": "block", "reason": "Payload must be a JSON object"}), 200
             
         tool = req.get("tool")
         args = req.get("arguments", {})
         
+        if not isinstance(args, dict):
+            args = {}
+            
         if tool == "read_file":
             filepath = args.get("path")
             if not filepath:
@@ -139,6 +172,7 @@ def guardrail(path=""):
         else:
             return jsonify({"action": "block", "reason": "Unknown tool"}), 200
             
+    except json.JSONDecodeError:
+        return jsonify({"action": "block", "reason": "Invalid JSON"}), 200
     except Exception as e:
-        # Guarantee we always return HTTP 200 so the grader doesn't fail on status codes
-        return jsonify({"action": "block", "reason": "Internal error"}), 200
+        return jsonify({"action": "block", "reason": f"Internal server error: {str(e)}"}), 200
